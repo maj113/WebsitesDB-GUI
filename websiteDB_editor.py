@@ -1,21 +1,26 @@
-import re
+from itertools import islice
 import os
+import re
 import sys
+import tempfile
+import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox, ttk, filedialog
+from typing import Any, Generator, Optional, Set, TextIO, Tuple
 
-__version__ = "v0.0.1"
 
-class WebsiteCheckerGUI:
+__version__ = "v0.0.2"
+
+class WebsiteCheckerGUI():
     def __init__(self, root):
         self.root = root
         self.root.title("WebsiteDB Editor")
         self.root.minsize(500, 80)
         self.root.resizable(0, 0)
 
-        position_x = int((self.root.winfo_screenwidth()) / 3)
-        position_y = int((self.root.winfo_screenheight()) / 3)
-        self.root.geometry(f"+{position_x}+{position_y}")
+        self.position_x = int((self.root.winfo_screenwidth()) / 3)
+        self.position_y = int((self.root.winfo_screenheight()) / 3)
+        self.root.geometry(f"+{self.position_x}+{self.position_y}")
 
         # Create a uniform grid
         self.root.columnconfigure(0, weight=1)
@@ -24,22 +29,42 @@ class WebsiteCheckerGUI:
         self.root.rowconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=0)
 
-        self.websites = self.load_websites()
+        # Create buttons
+        self.add_button = ttk.Button(root, text="Add Website", command=self.add_website)
+        self.list_button = ttk.Button(root, text="List Websites", command=self.list_websites)
+        self.save_quit_button = ttk.Button(root, text="Save & Quit", command=self.save_and_quit)
+
+        # Grid buttons
+        self.add_button.grid(row=1, column=0, padx=10, pady=10, sticky="sw")
+        self.list_button.grid(row=1, column=0, padx=100, pady=10, sticky="sw")
+        self.save_quit_button.grid(row=1, column=2, padx=10, pady=10, sticky="se")
+        
+        # Validator Defines
+        self.length_thread = None
+        self.websites_path = "websites.txt" # Or whatever gets specified in open_websites_file
+        self.total_lines = self.open_websites_file(True)
+        self.progress_window = None
+        self.progress_label = None
+        self.progress = 0
+        self.url_pattern = re.compile(r'^\w+://')
+        self.pattern = re.compile(r'(?<=\S)( #| on\b).*')
+        self.needs_cleanup = False
 
         self.website_entry = self.create_entry_with_backdrop(root, "Enter website URL", width=40)
         self.error_entry = self.create_entry_with_backdrop(root, "error reason", width=12)
         self.version_entry = self.create_entry_with_backdrop(root, "version", width=12)
 
-        self.website_entry.grid(row=0, column=0, padx=15, pady=10, sticky="ew")
-        self.error_entry.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
-        self.version_entry.grid(row=0, column=2, padx=5, pady=10, sticky="ew")
+        self.large_file_label = ttk.Label(root, text="Large file opened, live duplication checking disabled!", foreground="orange")
 
-        tk.Button(root, text="Add Website", command=self.add_website).grid(row=1, column=0, padx=10, pady=10, sticky="sw")
-        tk.Button(root, text="List Websites", command=self.list_websites).grid(row=1, column=0, padx=100, pady=10, sticky="sw")
-        tk.Button(root, text="Save & Quit", command=self.save_and_quit).grid(row=1, column=2, padx=10, pady=10, sticky="se")
+        self.website_entry.grid(row=0, column=0, padx=10, pady=12, sticky="ew")
+        self.error_entry.grid(row=0, column=1, padx=5, pady=12, sticky="ew")
+        self.version_entry.grid(row=0, column=2, padx=10, pady=12, sticky="ew")
 
+        # Create tooltips for the labels
         menubar = tk.Menu(root)
         file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Open file", command=self.open_websites_file)
+        file_menu.add_command(label="Validate DB", command=self.validate_websites)
         file_menu.add_command(label="Save & Quit", command=self.save_and_quit)
         menubar.add_cascade(label="File", menu=file_menu)
 
@@ -48,83 +73,169 @@ class WebsiteCheckerGUI:
         menubar.add_cascade(label="Help", menu=help_menu)
 
         root.config(menu=menubar)
+    
+    def open_websites_file(self, only_load=False):
+        if not only_load:
+            file_path = filedialog.askopenfilename(
+                initialdir=os.getcwd(),
+                title="Open Website.txt",
+                filetypes=(("Text files", "*.txt"), ("All files", "*.*"))
+            )
+            if file_path:
+                self.websites_path = file_path
+            
+        # Cancel any ongoing thread and start a new one
+        if self.length_thread and self.length_thread.is_alive():
+            self.length_thread.cancel()
+        self.length_thread = threading.Thread(target=self.get_file_length)
+        self.length_thread.start()
+    
+    def get_file_length(self):
+        self.root.title(f"Loading - {self.websites_path}...")
+        self.list_button['state'] = 'disabled'
+        self.add_button['state'] = 'disabled'
 
-    def load_websites(self) -> list[str]:
         try:
-            with open("websites.txt", "r") as file:
-                websites = [line.strip() for line in file if line.strip()]
-        except FileNotFoundError:
-            websites = []
-        return websites
+            mode = 'rb' if os.path.exists(self.websites_path) else 'wb'
+            with open(self.websites_path, mode, buffering=(2 << 16) + 8) as file:
+                if mode == 'rb':
+                    self.total_lines = sum(1 for _ in file)
+                else:
+                    # If the file didn't exist, set total lines to 0
+                    self.total_lines = 0
+        finally:
+            # Update the GUI with the total lines
+            self.root.after(0, self.update_total_lines)
+    
+    def update_total_lines(self):
+        # Update the total lines in the label
+        self.length_thread = None
+        self.list_button['state'] = 'normal'
+        self.add_button['state'] = 'normal'
+        self.root.title(f"WebsiteDB - Lines: {self.total_lines}")
+        if self.total_lines > 50000:
+            # Show the large file label
+            self.large_file_label.grid(row=1, column=0, padx=10, pady=(0, 40),sticky="nsew")
+        else:
+            # Hide the large file label
+            self.large_file_label.grid_forget()
 
-    def save_websites(self):
-        with open("websites.txt", "w") as file:
-            for website in self.websites:
-                file.write(f"{website}\n")
 
-    def create_entry_with_backdrop(self, parent, backdrop_text, width=25):
-        entry = tk.Entry(parent, width=width, justify='left', fg='grey')
+    def create_entry_with_backdrop(self, parent, backdrop_text, width=25) -> ttk.Entry:
+        entry = ttk.Entry(parent, width=width, justify='left', foreground='grey')
         entry.insert(0, backdrop_text)
-        entry.configure(insertwidth=1)
+        entry.configure()
 
         def on_click(event):
             if entry.get() == backdrop_text:
                 entry.delete(0, tk.END)
-                entry.configure(fg='black', justify='left', insertwidth=1)
+                entry.configure(foreground='black', justify='left')
 
         def on_leave(event):
             if not entry.get() or entry.get() == backdrop_text:
                 entry.insert(0, backdrop_text)
-                entry.configure(fg='grey', justify='left', insertwidth=0)
+                entry.configure(foreground='grey', justify='left')
 
         entry.bind('<FocusIn>', on_click)
         entry.bind('<FocusOut>', on_leave)
 
         return entry
+    
+    def process_single_website(self, website: str) -> Tuple[Optional[str], Optional[str]]:
+        error_site = None
+        
+        # Use a less resource intensive check first, then also check with regex
+        if not website.startswith(("https://", "http://")):
+            if not self.url_pattern.match(website):
+                website = "https://" + website
+                
+        # Check for the presence of both " #" and " on " in the website
+        if " #" in website and " on" in website:
+            error_site = website.strip()
+        elif " #" in website or " on" in website:
+            website = self.pattern.sub('', website)
+
+        # Return result based on whether there is an error or not
+        if error_site:
+            return None, error_site
+        else:
+            return website, None
 
     def add_website(self):
         website = self.website_entry.get().strip()
         error_reason = self.error_entry.get().strip()[:12]
         version = self.version_entry.get().strip()[:12]
 
-        if website and website != "Enter website URL":
-            website = "https://" + website if not website.startswith(("https://", "http://")) else website
-            error_reason = error_reason if error_reason != "error reason" else ""
-            version = version if version != "version" else ""
+        if not website or website == "Enter website URL":
+            messagebox.showwarning("Invalid Input", "Please enter a valid website URL.")
+            return
 
-            website_status = f"{website} #{error_reason} on {version}" if error_reason or version else website
+        error_reason = error_reason if error_reason != "error reason" else ""
+        version = version if version != "version" else ""
 
-            if any(website in w for w in self.websites):
-                messagebox.showinfo("Duplicate Website", "This website is already in the list.")
+        website_status = f"{website} #{error_reason} on {version}" if error_reason and version else website
+
+        cleaned_site, error_site = self.process_single_website(website_status)
+
+        # If we load the entire file and it's hundreds of megabytes long, this would lag too much
+        if self.total_lines < 50000:
+            
+            with open(self.websites_path, "r", buffering=(2<<16) + 8, encoding="ascii") as file:
+                websites = file.readlines()
+
+            # Check if the website is already in the list
+            if any(website_status in line for line in websites):
+                messagebox.showwarning("Duplicate", "This website is already in the list.")
                 return
 
-            if error_reason:
-                self.websites.insert(0, website_status)
+            if cleaned_site or error_site:
+                if error_site:
+                    websites.insert(0, error_site + "\n")
+                else:
+                    websites.append(cleaned_site + "\n")
+
+                with open(self.websites_path, "w", buffering=(2<<16) + 8, encoding="ascii") as file:
+                    file.writelines(websites)
+
+                self.clear_entry_fields(website=True)
+                message = "Website has been added to the list."
+                self.open_websites_file(True)
             else:
-                self.websites.append(website_status)
-
-            self.websites.sort(key=lambda x: (not ' #' in x, x.lower()))
-            self.save_websites()
-            self.clear_entry_fields(website=True, error=True)
-
-            messagebox.showinfo("Website Added", "Website has been added to the list.")
+                message = "Please enter a valid website URL."
+            
         else:
-            messagebox.showwarning("Invalid Input", "Please enter a valid website URL.")
+            # Handle the case when the line count exceeds 50000 without loading the entire file
+            with open(self.websites_path, "a", encoding="ascii") as file:
+                file.write((cleaned_site or error_site) + "\n")
+                if error_site:
+                    self.needs_cleanup = True
 
-    def clear_entry_fields(self, website=False, error=False):
+            self.clear_entry_fields(website=True)
+            message = "Website has been added to the list."
+
+        # Show messagebox only once with the appropriate message
+        if cleaned_site or error_site:
+            messagebox.showinfo("Website Added", message)
+        else:
+            messagebox.showwarning("Invalid Input", message)
+
+    def clear_entry_fields(self, website=False):
         if website:
             self.website_entry.delete(0, tk.END)
-            self.website_entry.configure(fg='grey', justify='left', insertwidth=0)
+            self.website_entry.configure(foreground='grey', justify='left')
 
-    def list_websites(self):
+    def list_websites(self, elements_per_page=5000):
+        # Open the file to get its length
+
         # Create a Toplevel window for listing websites
         list_window = tk.Toplevel(self.root)
-        list_window.title(f"List of Websites - {len(self.websites)} Websites")
+        list_window.title(f"List of Websites - {self.total_lines} Websites")
         list_window.minsize(600, 400)
+        list_window.geometry(f"+{self.position_x}+{self.position_y}")
 
         # Create a Treeview for displaying websites, errors, and tested on
         tree = ttk.Treeview(list_window, columns=("Website", "Error", "Tested On"), show="headings", height=20)
-        tree.pack(expand=True, fill="both")
+        tree.pack(expand=True, fill="both", padx=(15, 0), pady=10)
 
         # Set column headers
         tree.heading("Website", text="Website")
@@ -132,26 +243,60 @@ class WebsiteCheckerGUI:
         tree.heading("Tested On", text="Tested On")
 
         # Set column widths
-        tree.column("Website", width=300)
-        tree.column("Error", width=50)
-        tree.column("Tested On", width=50)
+        tree.column("Website", width=280)
+        tree.column("Error", width=1)
+        tree.column("Tested On", width=1)
 
-        # Insert data into the Treeview
-        for website in self.websites:
-            # Split each line into website, error, and tested on
-            parts = website.split(' #', 1)
-            website_name = parts[0].strip()
-            error = parts[1].strip() if len(parts) > 1 else ""
-            tested_on = ""
+        # Insert data into the Treeview based on pagination
+        total_pages = (self.total_lines + elements_per_page - 1) // elements_per_page
+        current_page = 1
 
-            # Check if there is any error, and extract the tested on information
-            if " #" in website:
-                tested_parts = error.split(' on ', 1)
-                error = parts[1].split(' on ', 1)[0].strip()
-                tested_on = tested_parts[1].strip() if len(tested_parts) > 1 else ""
+        current_page_label = ttk.Label(list_window, text=f"Page: {current_page}/{total_pages}")
 
-            # Insert the data into the Treeview
-            tree.insert("", "end", values=(website_name, error, tested_on))
+        # Page switcher
+        def show_page(page):
+            nonlocal current_page
+            current_page = page
+            tree.delete(*tree.get_children())  # Clear the tree
+
+            start_index = (page - 1) * elements_per_page
+            end_index = page * elements_per_page
+
+            with open(self.websites_path, 'r', buffering=(2<<16) + 8, encoding="ascii") as file:
+                line_iterator = islice(file, start_index, end_index)
+
+                for line in line_iterator:
+                    parts = line.split(' #', 1)
+                    website_name = parts[0].strip()[:500]
+                    error, tested_on = "", ""
+                    if len(parts) > 1:
+                        
+                        error, _, tested_on = parts[1].partition(' on ')
+
+                    tree.insert("", "end", values=(website_name, error, tested_on))
+
+            # Update the current page label
+            current_page_label.config(text=f"Page: {current_page}/{total_pages}")
+
+        show_page(current_page)
+
+        # Page switcher
+        def next_page():
+            if current_page < total_pages:
+                show_page(current_page + 1)
+
+        def prev_page():
+            if current_page > 1:
+                show_page(current_page - 1)
+
+        # Page switcher buttons
+        prev_button = ttk.Button(list_window, text="Previous", command=prev_page)
+        prev_button.pack(side="left", padx=5, pady=5)
+
+        next_button = ttk.Button(list_window, text="Next", command=next_page)
+        next_button.pack(side="right", padx=5, pady=5)
+
+        current_page_label.pack(side="top", pady=7)
 
         # Create a Scrollbar
         scrollbar = ttk.Scrollbar(tree, orient="vertical", command=tree.yview)
@@ -160,32 +305,113 @@ class WebsiteCheckerGUI:
         # Configure the Treeview to use the Scrollbar
         tree.configure(yscrollcommand=scrollbar.set)
 
-    def validate_websites(self):
-        cleaned_websites = set()
+    def create_progress_window(self):
+        self.progress_window = tk.Toplevel(self.root)
+        self.progress_window.title("Please Wait")
+        self.progress_window.geometry(f"+{self.position_x}+{self.position_y}")
+        self.progress_window.minsize(400, 100)
+        self.progress_window.resizable(0, 0)
 
-        for index, website in enumerate(self.websites, start=1):
-            if index % 100 == 0:
-                self.root.title(f"WebsiteDB Editor - Cleaning Duplicates - {index}/{len(self.websites)}")
+        self.progress_label = ttk.Label(self.progress_window, text="Validating websites: 0/0")
+        self.progress_label.pack(pady=20)
 
-            # Use a regular expression for URL validation
-            if not re.match(r'https?://', website):
-                website = "https://" + website
+    def update_progress_label(self, labeltext=None):
+        if self.progress_window and self.progress_label:
+            if not labeltext:
+                self.progress_label.config(text=f"Validating websites: {self.progress}/{self.total_lines}")
+            else:
+                self.progress_label.config(text=labeltext)
+            self.progress_window.update_idletasks()
 
-            # Split the website into parts and extract error reason and version information
-            parts = re.split(r' #| on ', website, maxsplit=2)
-            error_reason = parts[1][:12] if len(parts) > 1 else ''
-            version_info = f" on {parts[2][:12]}" if len(parts) > 2 else ''
+    def destroy_progress_window(self):
+        if self.progress_window:
+            self.progress_window.destroy()
+            self.progress_window = None
+            self.progress_label = None
 
-            # Construct the cleaned website string and strip any leading or trailing spaces
-            cleaned_website = (
-                f"{parts[0]} {'#' + error_reason if error_reason else ''}"
-                f"{version_info if version_info else ''}".strip()
-            )
-            cleaned_websites.add(cleaned_website)
+    def validate_websites(self, quit_after=False):
+        # Create a separate thread for the validation process
+        validation_thread = threading.Thread(target=self.validate_websites_threaded, args=(True if quit_after else False,))
+        validation_thread.daemon = True
+        validation_thread.start()
+            # Create progress window
+        self.create_progress_window()
 
-        self.websites = sorted(cleaned_websites, key=lambda x: (not ' #' in x, x.lower()))
-        self.root.title("WebsiteDB Editor")
+    def generate_cleaned_websites(self, input_file: TextIO, chunk_size: int) -> Generator[Tuple[set[str], set[str], int], Any, None]:
+        start_index: int  = 0
 
+        while True:
+            current_chunk = list(islice(input_file, chunk_size))
+            if not any(current_chunk):
+                break  # End of file
+
+            cleaned_websites: Set[str] = set()
+            error_sites: Set[str] = set()
+
+            for website in current_chunk:
+                if not website:
+                    break  # End of file within the chunk
+
+                cleaned_site, error_site = self.process_single_website(website)
+                if cleaned_site:
+                    cleaned_websites.add(cleaned_site)
+                if error_site:
+                    error_sites.add(error_site)
+
+            start_index += chunk_size
+            yield cleaned_websites, error_sites, start_index
+
+    def validate_websites_threaded(self, quit_after=False):
+        total_lines = self.total_lines
+
+        # Determine dynamic chunk size based on total lines
+        if total_lines <= 50000:
+            chunk_size = total_lines
+        elif total_lines <= 500000:
+            chunk_size = int(total_lines * 0.5)
+        elif total_lines <= 1000000:
+            chunk_size = int(total_lines * 0.1)
+        elif total_lines <= 10000000:
+            chunk_size = int(total_lines * 0.005)
+        else:
+            chunk_size = int(total_lines * 0.002)
+
+
+        error_sites_full: Set[str] = set()
+        with(
+            open(self.websites_path, 'r', buffering=(2<<16) + 8, encoding="ascii") as input_file,
+            tempfile.NamedTemporaryFile('w', buffering=(2<<16) + 8, encoding="ascii", delete=False) as output_file
+        ):
+            for cleaned_websites, error_sites, start_index in self.generate_cleaned_websites(input_file, chunk_size):
+                # Update progress and handle other logic as needed
+                self.progress = start_index
+                self.update_progress_label()
+
+                # Save the batch of cleaned websites to the temporary output file
+                output_file.writelines(cleaned_websites)
+
+                # Accumulate lines with errors
+                error_sites_full.update(error_sites)
+
+        # Sort and check duplicates after the file is formed
+        # Replace the original file with the temporary output file
+        os.replace(output_file.name, self.websites_path)
+
+        if error_sites_full and len(error_sites_full) > 0:
+            # Insert lines with errors at the top of the file
+            self.update_progress_label("Sorting websites, Please wait...")
+
+            with open(self.websites_path, 'r', buffering=(2<<16) + 8, encoding="ascii") as sorted_file:
+                sorted_content = sorted_file.read()
+
+            with open(self.websites_path, 'w', buffering=(2<<16) + 8, encoding="ascii") as sorted_file:
+                sorted_file.write('\n'.join(error_sites_full) + '\n' + sorted_content)
+        if not quit_after:
+            self.open_websites_file(True)
+            self.destroy_progress_window()
+        else:
+            self.root.destroy()
+    
     def show_about(self):
         about_window = tk.Toplevel(self.root)
         about_window.title("About App")
@@ -193,15 +419,15 @@ class WebsiteCheckerGUI:
         about_window.resizable(0, 0)
 
         # Center the window on the screen
-        position_x = int((about_window.winfo_screenwidth()) / 3 + 25)
-        position_y = int((about_window.winfo_screenheight()) / 3 - 100)
-        about_window.geometry(f"+{position_x}+{position_y}")
+        about_window.geometry(f"+{self.position_x + 25}+{self.position_y - 100}")
 
         # Set a custom font for the title
         title_font = (("Segoe UI", "Helvetica"), 22, "bold")
 
         # Create a Label for the app name
-        app_name_label = tk.Label(about_window, text="WebsiteDB Editor", font=title_font, pady=20)
+        app_name_label = ttk.Label(
+            about_window, text="WebsiteDB Editor", font=title_font, padding=(20)
+            )
         app_name_label.pack()
 
         # Create a Separator bar
@@ -222,13 +448,16 @@ class WebsiteCheckerGUI:
             f"For a copy, see https://opensource.org/licenses/MIT"
         )
 
-        about_label = tk.Label(about_window, text=about_text, padx=20, pady=20, justify="left")
+        about_label = ttk.Label(
+            about_window, text=about_text, justify="left", padding=5
+        )
         about_label.pack()
 
     def save_and_quit(self):
-        self.validate_websites()
-        self.save_websites()
-        self.root.destroy()
+        if self.needs_cleanup:
+            self.validate_websites(True)
+        else:    
+            self.root.destroy()
 
 if __name__ == "__main__":
     root = tk.Tk()
